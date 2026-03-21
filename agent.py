@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = [".env.agent.secret", ".env.docker.secret"]
         env_file_encoding = "utf-8"
+        extra = "ignore"  # Ignore extra fields in .env files
 
 
 # Project root for path validation
@@ -142,20 +143,29 @@ def list_files(path: str) -> str:
         return f"Error listing directory: {e}"
 
 
-def query_api(method: str, path: str, body: str | None = None) -> str:
+def query_api(
+    method: str, path: str, body: str | None = None, settings: Settings | None = None
+) -> str:
     """Call the backend LMS API and return the response.
 
     Args:
         method: HTTP method (GET, POST, etc.)
         path: API endpoint path (e.g., /items/)
         body: Optional JSON request body for POST/PUT requests
+        settings: Optional settings object with LMS API key
 
     Returns:
         JSON string with status_code and body, or an error message
     """
-    # Load LMS API key from environment
-    lms_api_key = os.environ.get("LMS_API_KEY", "")
-    api_base_url = os.environ.get("AGENT_API_BASE_URL", "http://localhost:42002")
+    # Load LMS API key from settings or environment
+    lms_api_key = (
+        settings.lms_api_key if settings else os.environ.get("LMS_API_KEY", "")
+    )
+    api_base_url = (
+        settings.agent_api_base_url
+        if settings
+        else os.environ.get("AGENT_API_BASE_URL", "http://localhost:42002")
+    )
 
     if not lms_api_key:
         return "Error: LMS_API_KEY not set in environment"
@@ -163,8 +173,9 @@ def query_api(method: str, path: str, body: str | None = None) -> str:
     # Build the URL
     url = f"{api_base_url}{path}"
 
+    # Use Bearer token authentication (FastAPI HTTPBearer)
     headers = {
-        "X-API-Key": lms_api_key,
+        "Authorization": f"Bearer {lms_api_key}",
         "Content-Type": "application/json",
     }
 
@@ -381,11 +392,12 @@ def call_llm(messages: list, settings: Settings, tools: list | None = None) -> d
     return data
 
 
-def execute_tool_call(tool_call: dict) -> dict:
+def execute_tool_call(tool_call: dict, settings: Settings | None = None) -> dict:
     """Execute a single tool call and return the result.
 
     Args:
         tool_call: Dict with 'function' containing 'name' and 'arguments'
+        settings: Optional settings object for tools that need it
 
     Returns:
         Dict with 'tool', 'args', and 'result'
@@ -412,7 +424,11 @@ def execute_tool_call(tool_call: dict) -> dict:
         }
 
     try:
-        result = TOOL_FUNCTIONS[tool_name](**args)
+        # Pass settings to query_api
+        if tool_name == "query_api":
+            result = TOOL_FUNCTIONS[tool_name](**args, settings=settings)
+        else:
+            result = TOOL_FUNCTIONS[tool_name](**args)
     except TypeError as e:
         result = f"Error: Invalid arguments for {tool_name}: {e}"
     except Exception as e:
@@ -474,7 +490,7 @@ def run_agentic_loop(question: str, settings: Settings) -> tuple[str, str, list]
 
         # Execute each tool call
         for tool_call in tool_calls_in_response:
-            result = execute_tool_call(tool_call)
+            result = execute_tool_call(tool_call, settings)
             tool_calls.append(result)
 
             print(f"Tool result: {result['result'][:100]}...", file=sys.stderr)
