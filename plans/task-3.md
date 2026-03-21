@@ -3,35 +3,43 @@
 ## Overview
 
 This task extends the Task 2 agent with a new `query_api` tool that can query the deployed backend LMS API. The agent will answer:
+
 1. **Static system facts** - framework, ports, status codes (from reading source code)
 2. **Data-dependent queries** - item count, scores, analytics (from querying the API)
 
 ## New Tool: `query_api`
 
 ### Purpose
+
 Call the deployed backend API to retrieve data or test endpoints.
 
 ### Parameters
+
 - `method` (string, required) - HTTP method (GET, POST, etc.)
 - `path` (string, required) - API endpoint path (e.g., `/items/`)
 - `body` (string, optional) - JSON request body for POST/PUT requests
 
 ### Returns
+
 JSON string with:
+
 - `status_code`: HTTP status code
 - `body`: Response body as JSON/string
 
 ### Authentication
+
 - Uses `LMS_API_KEY` from `.env.docker.secret`
 - Sent as `X-API-Key` header in the request
 
 ### Function Signature
+
 ```python
 def query_api(method: str, path: str, body: str | None = None) -> str:
     """Call the backend API and return the response."""
 ```
 
 ### Tool Schema for LLM
+
 ```json
 {
   "type": "function",
@@ -73,6 +81,7 @@ The agent needs to read additional environment variables:
 | `AGENT_API_BASE_URL` | Base URL for `query_api` | `.env.docker.secret` or env | `http://localhost:42002` |
 
 ### Settings Class Update
+
 ```python
 class Settings(BaseSettings):
     """Load settings from .env.agent.secret and .env.docker.secret."""
@@ -129,6 +138,7 @@ Always provide a source reference when applicable:
 ## Agentic Loop Changes
 
 The agentic loop structure remains the same. We just:
+
 1. Add `query_api` to the TOOLS list
 2. Add `query_api` to the TOOL_FUNCTIONS mapping
 3. The loop automatically handles the new tool
@@ -145,14 +155,18 @@ The agentic loop structure remains the same. We just:
 ## Testing Strategy
 
 ### Local Tests (run_eval.py)
+
 The 10 questions cover:
+
 - 0-1: Wiki lookup (read_file)
 - 2-3: Source code reading (read_file, list_files)
 - 4-7: API queries (query_api, sometimes with read_file for debugging)
 - 8-9: Complex reasoning (LLM judge, read_file)
 
 ### Regression Tests (tests/test_agent.py)
+
 Add 2 new tests:
+
 1. `"What framework does the backend use?"` → expects `read_file` in tool_calls
 2. `"How many items are in the database?"` → expects `query_api` in tool_calls
 
@@ -174,9 +188,59 @@ Add 2 new tests:
 3. Repeat until all 10 pass
 
 Common issues to watch for:
+
 - Agent doesn't use a tool when it should → improve tool description
 - Tool returns error → fix tool implementation
 - Wrong arguments → clarify parameter descriptions
+- Answer doesn't match keywords → adjust system prompt phrasing
+
+## Benchmark Results and Iteration
+
+### Initial Run Status
+
+**Backend Status:** Not running (Docker not available in WSL)
+
+**Next Steps to Complete Testing:**
+
+1. **Start the backend services:**
+
+   ```bash
+   # Option A: Using Docker Desktop (recommended)
+   # Make sure Docker Desktop is running with WSL integration enabled
+   docker-compose --env-file .env.docker.secret up -d
+   
+   # Option B: Run backend directly with uv
+   cd backend
+   uv run python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 42002
+   ```
+
+2. **Fill in `.env` with autochecker credentials:**
+
+   ```
+   AUTOCHECKER_API_URL=https://auche.namaz.live
+   AUTOCHECKER_EMAIL=<your-university-email>
+   AUTOCHECKER_PASSWORD=<your-github-username>-<telegram-alias>
+   ```
+
+3. **Run the evaluation:**
+
+   ```bash
+   uv run run_eval.py
+   ```
+
+4. **Iterate on failures:**
+   - Read the feedback hint
+   - Check which tool was used (or not used)
+   - Adjust system prompt or tool description
+   - Re-run until all 10 pass
+
+### Expected Iterations
+
+Based on the task description, common issues:
+
+- Agent doesn't use `query_api` for data questions → improve tool description
+- Agent uses wrong HTTP method → clarify in system prompt
+- API returns 401 → check `LMS_API_KEY` is set correctly
 - Answer doesn't match keywords → adjust system prompt phrasing
 
 ## Acceptance Criteria Checklist

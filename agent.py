@@ -144,7 +144,11 @@ def list_files(path: str) -> str:
 
 
 def query_api(
-    method: str, path: str, body: str | None = None, settings: Settings | None = None
+    method: str,
+    path: str,
+    body: str | None = None,
+    settings: Settings | None = None,
+    auth: bool = True,
 ) -> str:
     """Call the backend LMS API and return the response.
 
@@ -153,6 +157,7 @@ def query_api(
         path: API endpoint path (e.g., /items/)
         body: Optional JSON request body for POST/PUT requests
         settings: Optional settings object with LMS API key
+        auth: Whether to include authentication header (default: True)
 
     Returns:
         JSON string with status_code and body, or an error message
@@ -167,19 +172,20 @@ def query_api(
         else os.environ.get("AGENT_API_BASE_URL", "http://localhost:42002")
     )
 
-    if not lms_api_key:
-        return "Error: LMS_API_KEY not set in environment"
-
     # Build the URL
     url = f"{api_base_url}{path}"
 
     # Use Bearer token authentication (FastAPI HTTPBearer)
     headers = {
-        "Authorization": f"Bearer {lms_api_key}",
         "Content-Type": "application/json",
     }
 
-    print(f"Calling API: {method} {url}", file=sys.stderr)
+    if auth:
+        if not lms_api_key:
+            return "Error: LMS_API_KEY not set in environment"
+        headers["Authorization"] = f"Bearer {lms_api_key}"
+
+    print(f"Calling API: {method} {url} (auth={auth})", file=sys.stderr)
 
     try:
         if method.upper() == "GET":
@@ -283,6 +289,10 @@ TOOLS = [
                     "body": {
                         "type": "string",
                         "description": "JSON request body (optional, for POST/PUT requests)",
+                    },
+                    "auth": {
+                        "type": "boolean",
+                        "description": "Whether to include authentication header (default: true). Set to false to test unauthenticated access.",
                     },
                 },
                 "required": ["method", "path"],
