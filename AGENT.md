@@ -2,7 +2,7 @@
 
 ## Overview
 
-This is a CLI-based agent that connects to an LLM (Large Language Model) API and returns structured JSON responses. It serves as the foundation for a more advanced agentic system that will be built in subsequent tasks.
+This is a CLI-based agent with **tools** and an **agentic loop** that connects to an LLM API and returns structured JSON responses. The agent can read files and list directories from the project wiki to answer questions with proper source references.
 
 ## LLM Provider
 
@@ -11,6 +11,7 @@ This is a CLI-based agent that connects to an LLM (Large Language Model) API and
 **Model:** `coder-model` (Qwen 3.5 Plus)
 
 **Why this provider:**
+
 - OpenAI-compatible API (easy integration)
 - 1000 free requests per day
 - Works from Russia without restrictions
@@ -18,31 +19,115 @@ This is a CLI-based agent that connects to an LLM (Large Language Model) API and
 
 ## Architecture
 
+### Agentic Loop
+
+The agent implements a multi-step reasoning loop:
+
+```
+User Input (CLI arg) → Send to LLM with tools → LLM returns tool_calls
+                                                        ↓
+                                         Execute tools (read_file, list_files)
+                                                        ↓
+                                         Append results as tool messages
+                                                        ↓
+                                         Send back to LLM (repeat)
+                                                        ↓
+                                         LLM returns final answer
+                                                        ↓
+                                         Output JSON (answer, source, tool_calls)
+```
+
+1. Send the user's question + tool definitions to the LLM
+2. If the LLM responds with `tool_calls`:
+   - Execute each tool call
+   - Append results as `tool` role messages
+   - Send back to LLM and repeat
+3. If the LLM responds with a text message (no tool calls):
+   - Extract the answer and source
+   - Output JSON and exit
+4. Maximum 10 tool calls per question (safety limit)
+
 ### Data Flow
 
 ```
-User Input (CLI arg) → agent.py → LLM API → JSON Output (stdout)
+User Input → agent.py → LLM API (with tools) → Tool Execution → LLM API → JSON Output
 ```
-
-1. User provides a question as a command-line argument
-2. `agent.py` reads environment variables from `.env.agent.secret`
-3. `agent.py` makes an HTTP POST request to the LLM's `/chat/completions` endpoint
-4. The LLM processes the question and returns a response
-5. `agent.py` extracts the answer and outputs JSON to stdout
 
 ### Components
 
 #### `agent.py`
 
-The main CLI entry point with the following responsibilities:
+The main CLI entry point with the following components:
 
-- **Argument Parsing:** Reads the question from `sys.argv[1]`
-- **Settings Loading:** Uses `pydantic-settings` to load API credentials from `.env.agent.secret`
-- **LLM Client:** Uses `httpx` to make async HTTP requests to the LLM API
-- **Response Parsing:** Extracts the answer from the LLM response structure
-- **Output Formatting:** Outputs valid JSON with `answer` and `tool_calls` fields
+**1. Settings Loader**
 
-### Environment Variables
+- Uses `pydantic-settings` to load API credentials from `.env.agent.secret`
+- Validates required environment variables
+
+**2. Tool Functions**
+
+- `read_file(path)`: Read a file from the project repository
+- `list_files(path)`: List files and directories at a given path
+- Both tools validate paths to prevent directory traversal attacks
+
+**3. Path Security**
+
+- `validate_path(relative_path)`: Ensures paths stay within project root
+- Rejects any path containing `..`
+- Verifies resolved absolute path starts with project root
+
+**4. LLM Client**
+
+- Uses `httpx` for HTTP requests to the LLM API
+- Supports function calling with tool definitions
+- Handles timeouts (60 seconds) and API errors gracefully
+
+**5. Agentic Loop**
+
+- `run_agentic_loop(question, settings)`: Main loop that orchestrates tool usage
+- Tracks all tool calls for output
+- Extracts source references from the final answer
+
+**6. Response Parser**
+
+- Extracts the answer from the LLM response
+- Parses tool calls and their results
+- Outputs valid JSON with `answer`, `source`, and `tool_calls` fields
+
+### Tool Schemas
+
+Tools are registered as function-calling schemas in OpenAI-compatible format:
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "read_file",
+    "description": "Read a file from the project repository",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Relative path from project root"
+        }
+      },
+      "required": ["path"]
+    }
+  }
+}
+```
+
+### System Prompt Strategy
+
+The system prompt instructs the LLM to:
+
+1. Use `list_files` to discover wiki files when needed
+2. Use `read_file` to read specific wiki files and find answers
+3. Include the source reference (file path + section anchor) in the final answer
+4. Only make tool calls when necessary to answer the question
+
+## Environment Variables
 
 The agent reads from `.env.agent.secret`:
 
@@ -52,19 +137,24 @@ The agent reads from `.env.agent.secret`:
 | `LLM_API_BASE_URL` | Base URL of the LLM API | `http://vm-ip:8080/v1` |
 | `LLM_API_MODEL` | Model name to use | `coder-model` |
 
-### Output Format
+## Output Format
 
 The agent outputs a single JSON line to stdout:
 
 ```json
 {
-  "answer": "The LLM's response text",
-  "tool_calls": []
+  "answer": "Edit the conflicting file, choose which changes to keep, then stage and commit.",
+  "source": "wiki/git-vscode.md#resolve-a-merge-conflict",
+  "tool_calls": [
+    {"tool": "list_files", "args": {"path": "wiki"}, "result": "git-workflow.md\ngit-vscode.md\n..."},
+    {"tool": "read_file", "args": {"path": "wiki/git-vscode.md"}, "result": "..."}
+  ]
 }
 ```
 
-- `answer`: The text response from the LLM
-- `tool_calls`: Empty array (will be populated in Task 2 when tools are added)
+- `answer`: The LLM's final answer text
+- `source`: The wiki section reference (e.g., `wiki/git-vscode.md#resolve-a-merge-conflict`)
+- `tool_calls`: Array of all tool calls made, each with `tool`, `args`, and `result`
 
 ### Error Handling
 
@@ -73,6 +163,9 @@ The agent outputs a single JSON line to stdout:
 - **API timeout:** Exits with code 1 after 60 seconds
 - **Connection error:** Exits with code 1, prints error to stderr
 - **Invalid response:** Exits with code 1, prints error to stderr
+- **File not found:** Returns error message as tool result, continues loop
+- **Path traversal attempt:** Returns error message, does not access file
+- **Max iterations reached:** Stops loop, returns best available answer
 
 All debug/error output goes to **stderr**, keeping stdout clean for JSON output.
 
@@ -81,18 +174,25 @@ All debug/error output goes to **stderr**, keeping stdout clean for JSON output.
 ### Basic Usage
 
 ```bash
-uv run agent.py "What is the capital of France?"
+uv run agent.py "How do you resolve a merge conflict?"
 ```
 
 ### Expected Output
 
 ```json
-{"answer": "The capital of France is Paris.", "tool_calls": []}
+{
+  "answer": "To resolve a merge conflict, open the conflicting file and look for conflict markers...",
+  "source": "wiki/git-vscode.md#resolve-a-merge-conflict",
+  "tool_calls": [
+    {"tool": "list_files", "args": {"path": "wiki"}, "result": "..."},
+    {"tool": "read_file", "args": {"path": "wiki/git-vscode.md"}, "result": "..."}
+  ]
+}
 ```
 
 ### Testing
 
-Run the regression test:
+Run the regression tests:
 
 ```bash
 uv run pytest tests/test_agent.py
@@ -115,19 +215,33 @@ The agent uses the following dependencies (already in `pyproject.toml`):
 
 ```
 se-toolkit-lab-6/
-├── agent.py              # Main CLI entry point
+├── agent.py              # Main CLI entry point with tools and agentic loop
 ├── .env.agent.secret     # LLM credentials (gitignored)
 ├── AGENT.md              # This documentation
 ├── plans/
-│   └── task-1.md         # Implementation plan
+│   └── task-1.md         # Implementation plan for Task 1
+│   └── task-2.md         # Implementation plan for Task 2
 └── tests/
-    └── test_agent.py     # Regression test
+    └── test_agent.py     # Regression tests
 ```
 
-## Future Work (Tasks 2-3)
+## Security
 
-In the next tasks, the agent will be extended with:
+### Path Validation
 
-- **Tools:** Ability to call external tools (file read, API queries, etc.)
-- **Agentic Loop:** Multi-step reasoning with tool usage
-- **Domain Knowledge:** Integration with the backend LMS
+All file operations validate paths to prevent directory traversal:
+
+1. Reject any path containing `..`
+2. Resolve the full absolute path
+3. Verify the resolved path starts with the project root
+4. Return an error message if validation fails
+
+This ensures the agent cannot read files outside the project directory.
+
+## Future Work (Task 3)
+
+In the next task, the agent will be extended with:
+
+- **Backend Integration:** Query the LMS backend via `query_api` tool
+- **Domain Knowledge:** Answer questions about courses, students, and grades
+- **Multi-hop Reasoning:** Chain multiple API calls to answer complex questions
