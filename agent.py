@@ -22,10 +22,14 @@ import json
 import os
 import re
 import sys
+import warnings
 from pathlib import Path
 
 import httpx
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Suppress Pydantic deprecation warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
 class Settings(BaseSettings):
@@ -44,10 +48,11 @@ class Settings(BaseSettings):
     lms_api_key: str = ""
     agent_api_base_url: str = "http://localhost:42002"
 
-    class Config:
-        env_file = [".env.agent.secret", ".env.docker.secret"]
-        env_file_encoding = "utf-8"
-        extra = "ignore"  # Ignore extra fields in .env files
+    model_config = SettingsConfigDict(
+        env_file=[".env.agent.secret", ".env.docker.secret"],
+        env_file_encoding="utf-8",
+        extra="ignore",  # Ignore extra fields in .env files
+    )
 
 
 # Project root for path validation
