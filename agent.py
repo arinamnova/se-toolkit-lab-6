@@ -58,8 +58,8 @@ class Settings(BaseSettings):
 # Project root for path validation
 PROJECT_ROOT = Path(__file__).parent.resolve()
 
-# Maximum tool calls per question
-MAX_TOOL_CALLS = 10
+# Maximum tool calls per question (reduced for efficiency)
+MAX_TOOL_CALLS = 5
 
 
 def load_settings() -> Settings:
@@ -314,7 +314,7 @@ TOOL_FUNCTIONS = {
 }
 
 # System prompt for the agent
-SYSTEM_PROMPT = """You are a helpful assistant that answers questions using:
+SYSTEM_PROMPT = """You are a helpful assistant that answers questions efficiently using:
 1. The project wiki (for documentation)
 2. The source code (for implementation details)
 3. The backend API (for live data)
@@ -325,29 +325,22 @@ You have access to three tools:
 - query_api: Call the backend API to query data or test endpoints
 
 Tool selection guide:
-- For wiki/documentation questions (git, docker, ssh, etc.) → use list_files and read_file on wiki/
-- For source code questions (framework, architecture, code structure) → use list_files and read_file on backend/, agent.py, docker-compose.yml, etc.
+- For wiki/documentation questions (git, docker, ssh, etc.) → use read_file on wiki/filename.md
+- For source code questions (framework, architecture, code structure) → use read_file on specific files like backend/app/main.py
 - For data questions (counts, scores, records, "how many") → use query_api with GET
 - For API behavior questions (status codes, errors, authentication) → use query_api
 
 When using query_api:
 - Use GET for retrieving data (most common)
-- Use POST for creating data
 - Check the status_code in the response
 - For authentication errors (401, 403), note that the API requires an API key
 
 Always provide a source reference when applicable:
 - Wiki files: wiki/filename.md#section-anchor
-- Source files: path/to/file.py (or path/to/file.py:function_name if you can identify a function)
+- Source files: path/to/file.py
 - API responses: API endpoint path (e.g., GET /items/)
 
-For complex questions:
-1. First explore with list_files if you're unsure where to look
-2. Read relevant files with read_file
-3. For API questions, query the endpoint and analyze the response
-4. If you get an error from the API, read the source code to diagnose the bug
-
-Be specific and cite your sources."""
+Be concise and direct. Minimize tool calls - prefer reading specific files directly rather than exploring with list_files."""
 
 
 def call_llm(messages: list, settings: Settings, tools: list | None = None) -> dict:
