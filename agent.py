@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sys
+import time
 import warnings
 from pathlib import Path
 
@@ -491,6 +492,11 @@ def run_agentic_loop(question: str, settings: Settings) -> tuple[str, str, list]
         iteration += 1
         print(f"\n--- Iteration {iteration} ---", file=sys.stderr)
 
+        # Add delay between LLM calls to avoid rate limiting
+        if iteration > 1:
+            print("Waiting 2 seconds before next LLM call...", file=sys.stderr)
+            time.sleep(2)
+
         # Call LLM with tools
         response = call_llm(messages, settings, tools=TOOLS)
 
@@ -552,6 +558,9 @@ def run_agentic_loop(question: str, settings: Settings) -> tuple[str, str, list]
                     "content": result["result"],
                 }
             )
+
+        # Add small delay after tool execution
+        time.sleep(1)
 
     # Max iterations reached - return best available answer
     print(f"Warning: Reached maximum tool calls ({MAX_TOOL_CALLS})", file=sys.stderr)
