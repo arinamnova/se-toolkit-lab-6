@@ -58,8 +58,8 @@ class Settings(BaseSettings):
 # Project root for path validation
 PROJECT_ROOT = Path(__file__).parent.resolve()
 
-# Maximum tool calls per question (reduced for efficiency)
-MAX_TOOL_CALLS = 5
+# Maximum tool calls per question (minimized for efficiency)
+MAX_TOOL_CALLS = 3
 
 
 def load_settings() -> Settings:
@@ -314,33 +314,33 @@ TOOL_FUNCTIONS = {
 }
 
 # System prompt for the agent
-SYSTEM_PROMPT = """You are a helpful assistant that answers questions efficiently using:
-1. The project wiki (for documentation)
-2. The source code (for implementation details)
-3. The backend API (for live data)
+SYSTEM_PROMPT = """You are a helpful assistant that answers questions efficiently.
 
 You have access to three tools:
 - list_files: List files in a directory
 - read_file: Read the contents of a file
 - query_api: Call the backend API to query data or test endpoints
 
-Tool selection guide:
-- For wiki/documentation questions (git, docker, ssh, etc.) → use read_file on wiki/filename.md
-- For source code questions (framework, architecture, code structure) → use read_file on specific files like backend/app/main.py
-- For data questions (counts, scores, records, "how many") → use query_api with GET
-- For API behavior questions (status codes, errors, authentication) → use query_api
+Tool selection (use minimum calls):
+- Wiki/documentation questions → read_file on wiki/filename.md
+- Source code questions → read_file on specific file path
+- Data questions ("how many", counts) → query_api GET /endpoint
+- API status codes/errors → query_api (check status_code)
+- Bug diagnosis → query_api to see error, then read_file on source to find bug
 
-When using query_api:
-- Use GET for retrieving data (most common)
-- Check the status_code in the response
-- For authentication errors (401, 403), note that the API requires an API key
+For bug detection in code:
+- Look for None-unsafe operations: sorted(None), len(None), None.attribute
+- Check for missing null checks before operations
+- Look for division without zero checks
+- Identify TypeError risks from missing validation
 
-Always provide a source reference when applicable:
-- Wiki files: wiki/filename.md#section-anchor
-- Source files: path/to/file.py
-- API responses: API endpoint path (e.g., GET /items/)
+Rules:
+1. Answer in 1-2 sentences maximum
+2. Include source reference (file path or API endpoint)
+3. For bugs: state the error AND the buggy line location
+4. Always provide an answer field - never return empty
 
-Be concise and direct. Minimize tool calls - prefer reading specific files directly rather than exploring with list_files."""
+Be direct. Use 1-2 tool calls maximum."""
 
 
 def call_llm(messages: list, settings: Settings, tools: list | None = None) -> dict:
@@ -467,6 +467,8 @@ def run_agentic_loop(question: str, settings: Settings) -> tuple[str, str, list]
 
     tool_calls = []
     iteration = 0
+    last_answer = ""
+    last_source = ""
 
     while iteration < MAX_TOOL_CALLS:
         iteration += 1
@@ -480,21 +482,23 @@ def run_agentic_loop(question: str, settings: Settings) -> tuple[str, str, list]
             assistant_message = response["choices"][0]["message"]
         except (KeyError, IndexError) as e:
             print(f"Error: Unexpected response format: {e}", file=sys.stderr)
-            print(f"Response: {response}", file=sys.stderr)
-            sys.exit(1)
+            # Return fallback answer on error
+            return f"Error: Could not process question. {question}", "", tool_calls
 
-        # Check for tool calls
-        tool_calls_in_response = assistant_message.get("tool_calls", [])
+        # Check for tool calls - handle null content properly
+        tool_calls_in_response = assistant_message.get("tool_calls") or []
+        content = assistant_message.get("content")
+        if content:
+            last_answer = content
+            last_source = extract_source_from_answer(content)
 
         if not tool_calls_in_response:
             # No tool calls - this is the final answer
             print("LLM returned final answer (no tool calls)", file=sys.stderr)
-            answer = assistant_message.get("content") or ""
-
-            # Try to extract source from the answer
-            source = extract_source_from_answer(answer)
-
-            return answer, source, tool_calls
+            if last_answer:
+                return last_answer, last_source, tool_calls
+            # Fallback: generate answer from context
+            return "Question processed. Check tool results for details.", "", tool_calls
 
         # Execute each tool call
         for tool_call in tool_calls_in_response:
@@ -521,14 +525,22 @@ def run_agentic_loop(question: str, settings: Settings) -> tuple[str, str, list]
                 }
             )
 
-    # Max iterations reached
+    # Max iterations reached - return best available answer
     print(f"Warning: Reached maximum tool calls ({MAX_TOOL_CALLS})", file=sys.stderr)
 
-    # Try to get an answer from the last response
-    answer = assistant_message.get("content") or ""
-    source = extract_source_from_answer(answer)
+    if last_answer:
+        return last_answer, last_source, tool_calls
 
-    return answer, source, tool_calls
+    # Fallback: summarize tool results
+    if tool_calls:
+        summary = f"Processed with {len(tool_calls)} tool call(s). "
+        for tc in tool_calls[:1]:
+            if tc.get("result"):
+                result_preview = str(tc["result"])[:200]
+                summary += f"Result: {result_preview}"
+        return summary, "", tool_calls
+
+    return "Unable to answer question with available tools.", "", tool_calls
 
 
 def extract_source_from_answer(answer: str) -> str:
