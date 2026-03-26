@@ -58,8 +58,8 @@ class Settings(BaseSettings):
 # Project root for path validation
 PROJECT_ROOT = Path(__file__).parent.resolve()
 
-# Maximum tool calls per question (minimized for efficiency)
-MAX_TOOL_CALLS = 3
+# Maximum tool calls per question (balanced for efficiency and completeness)
+MAX_TOOL_CALLS = 6
 
 
 def load_settings() -> Settings:
@@ -225,7 +225,17 @@ def query_api(
         except (json.JSONDecodeError, ValueError):
             pass
 
-        return json.dumps(result)
+        # Truncate large responses to avoid token exhaustion
+        result_str = json.dumps(result)
+        if len(result_str) > 4000:
+            # Truncate body and add notice
+            result["body"] = (
+                result["body"][:3500]
+                + f"\n... [truncated, total {len(result_str)} chars]"
+            )
+            return json.dumps(result)
+
+        return result_str
 
     except httpx.TimeoutException:
         return f"Error: API request timed out for {url}"
@@ -321,12 +331,14 @@ You have access to three tools:
 - read_file: Read the contents of a file
 - query_api: Call the backend API to query data or test endpoints
 
-Tool selection (use minimum calls):
-- Wiki/documentation questions → read_file on wiki/filename.md
-- Source code questions → read_file on specific file path
-- Data questions ("how many", counts) → query_api GET /endpoint
+Tool selection:
+- Wiki/documentation questions (SSH, VM, Docker, git) → read_file on wiki/filename.md
+- Source code questions (framework, imports, architecture) → read_file on specific file
+- Data questions ("how many", counts, scores) → query_api GET /endpoint
 - API status codes/errors → query_api (check status_code)
 - Bug diagnosis → query_api to see error, then read_file on source to find bug
+- Docker/deployment questions → read_file on docker-compose.yml, Dockerfile, Caddyfile
+- ETL/pipeline questions → read_file on backend/app/etl.py
 
 For bug detection in code:
 - Look for None-unsafe operations: sorted(None), len(None), None.attribute
@@ -334,13 +346,18 @@ For bug detection in code:
 - Look for division without zero checks
 - Identify TypeError risks from missing validation
 
+For error handling comparison:
+- ETL: Look for try/except, error logging, rollback
+- API: Look for exception_handler, HTTPException, error responses
+
 Rules:
-1. Answer in 1-2 sentences maximum
+1. Answer concisely but completely
 2. Include source reference (file path or API endpoint)
 3. For bugs: state the error AND the buggy line location
 4. Always provide an answer field - never return empty
+5. For wiki questions: cite wiki/filename.md#section
 
-Be direct. Use 1-2 tool calls maximum."""
+Be direct. Use minimum tool calls needed."""
 
 
 def call_llm(messages: list, settings: Settings, tools: list | None = None) -> dict:
@@ -502,10 +519,21 @@ def run_agentic_loop(question: str, settings: Settings) -> tuple[str, str, list]
 
         # Execute each tool call
         for tool_call in tool_calls_in_response:
-            result = execute_tool_call(tool_call, settings)
+            try:
+                result = execute_tool_call(tool_call, settings)
+            except Exception as e:
+                result = {
+                    "tool": tool_call.get("function", {}).get("name", "unknown"),
+                    "args": {},
+                    "result": f"Error executing tool: {e}",
+                }
             tool_calls.append(result)
 
-            print(f"Tool result: {result['result'][:100]}...", file=sys.stderr)
+            # Truncate tool result for display
+            result_preview = result.get("result", "")
+            if len(result_preview) > 100:
+                result_preview = result_preview[:100] + "..."
+            print(f"Tool result: {result_preview}", file=sys.stderr)
 
             # Add assistant message with tool call to conversation
             messages.append(
