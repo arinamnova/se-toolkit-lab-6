@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI agent with tools and agentic loop for wiki-based Q&A.
+"""CLI agent with tools and agentic loop for wiki and API-based Q&A.
 
 Usage:
     uv run agent.py "Your question here"
@@ -12,33 +12,54 @@ Environment:
     - LLM_API_KEY: API key for the LLM provider
     - LLM_API_BASE_URL: Base URL of the LLM API
     - LLM_API_MODEL: Model name to use
+
+    Reads from .env.docker.secret (optional, for query_api):
+    - LMS_API_KEY: API key for backend authentication
+    - AGENT_API_BASE_URL: Base URL for backend API (default: http://localhost:42002)
 """
 
 import json
+import os
+import re
 import sys
+import warnings
 from pathlib import Path
 
 import httpx
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Suppress Pydantic deprecation warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
 class Settings(BaseSettings):
-    """Load settings from .env.agent.secret."""
+    """Load settings from environment files.
 
+    Reads LLM settings from .env.agent.secret and backend settings from .env.docker.secret.
+    Also reads from environment variables for autochecker compatibility.
+    """
+
+    # LLM settings
     llm_api_key: str
     llm_api_base_url: str
     llm_api_model: str = "coder-model"
 
-    class Config:
-        env_file = ".env.agent.secret"
-        env_file_encoding = "utf-8"
+    # Backend API settings
+    lms_api_key: str = ""
+    agent_api_base_url: str = "http://localhost:42002"
+
+    model_config = SettingsConfigDict(
+        env_file=[".env.agent.secret", ".env.docker.secret"],
+        env_file_encoding="utf-8",
+        extra="ignore",  # Ignore extra fields in .env files
+    )
 
 
 # Project root for path validation
 PROJECT_ROOT = Path(__file__).parent.resolve()
 
-# Maximum tool calls per question
-MAX_TOOL_CALLS = 10
+# Maximum tool calls per question (reduced for efficiency)
+MAX_TOOL_CALLS = 5
 
 
 def load_settings() -> Settings:
@@ -127,19 +148,110 @@ def list_files(path: str) -> str:
         return f"Error listing directory: {e}"
 
 
+def query_api(
+    method: str,
+    path: str,
+    body: str | None = None,
+    settings: Settings | None = None,
+    auth: bool = True,
+) -> str:
+    """Call the backend LMS API and return the response.
+
+    Args:
+        method: HTTP method (GET, POST, etc.)
+        path: API endpoint path (e.g., /items/)
+        body: Optional JSON request body for POST/PUT requests
+        settings: Optional settings object with LMS API key
+        auth: Whether to include authentication header (default: True)
+
+    Returns:
+        JSON string with status_code and body, or an error message
+    """
+    # Load LMS API key from settings or environment
+    lms_api_key = (
+        settings.lms_api_key if settings else os.environ.get("LMS_API_KEY", "")
+    )
+    api_base_url = (
+        settings.agent_api_base_url
+        if settings
+        else os.environ.get("AGENT_API_BASE_URL", "http://localhost:42002")
+    )
+
+    # Build the URL
+    url = f"{api_base_url}{path}"
+
+    # Use Bearer token authentication (FastAPI HTTPBearer)
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    if auth:
+        if not lms_api_key:
+            return "Error: LMS_API_KEY not set in environment"
+        headers["Authorization"] = f"Bearer {lms_api_key}"
+
+    print(f"Calling API: {method} {url} (auth={auth})", file=sys.stderr)
+
+    try:
+        if method.upper() == "GET":
+            response = httpx.get(url, headers=headers, timeout=30.0)
+        elif method.upper() == "POST":
+            response = httpx.post(
+                url,
+                headers=headers,
+                json=json.loads(body) if body else {},
+                timeout=30.0,
+            )
+        elif method.upper() == "PUT":
+            response = httpx.put(
+                url,
+                headers=headers,
+                json=json.loads(body) if body else {},
+                timeout=30.0,
+            )
+        elif method.upper() == "DELETE":
+            response = httpx.delete(url, headers=headers, timeout=30.0)
+        else:
+            return f"Error: Unsupported HTTP method: {method}"
+
+        result = {
+            "status_code": response.status_code,
+            "body": response.text,
+        }
+
+        # Try to parse body as JSON for cleaner output
+        try:
+            result["body"] = response.json()
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        return json.dumps(result)
+
+    except httpx.TimeoutException:
+        return f"Error: API request timed out for {url}"
+    except httpx.ConnectError as e:
+        return f"Error: Cannot connect to API at {url}: {e}"
+    except httpx.RequestError as e:
+        return f"Error: API request failed: {e}"
+    except json.JSONDecodeError as e:
+        return f"Error: Invalid JSON body: {e}"
+    except Exception as e:
+        return f"Error querying API: {e}"
+
+
 # Tool definitions for LLM function calling
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a file from the project repository",
+            "description": "Read a file from the project repository. Use for wiki documentation or source code questions.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path from project root",
+                        "description": "Relative path from project root (e.g., wiki/git.md or backend/app/main.py)",
                     }
                 },
                 "required": ["path"],
@@ -150,16 +262,45 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "List files and directories at a given path",
+            "description": "List files and directories at a given path. Use to explore directory structure.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative directory path from project root",
+                        "description": "Relative directory path from project root (e.g., wiki or backend/app/routers)",
                     }
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_api",
+            "description": "Call the backend LMS API to query data or test endpoints. Use for questions about database contents, item counts, scores, API status codes, or error responses. NOT for wiki or source code questions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method (GET, POST, PUT, DELETE)",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "API endpoint path (e.g., /items/, /analytics/completion-rate)",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "JSON request body (optional, for POST/PUT requests)",
+                    },
+                    "auth": {
+                        "type": "boolean",
+                        "description": "Whether to include authentication header (default: true). Set to false to test unauthenticated access.",
+                    },
+                },
+                "required": ["method", "path"],
             },
         },
     },
@@ -169,25 +310,37 @@ TOOLS = [
 TOOL_FUNCTIONS = {
     "read_file": read_file,
     "list_files": list_files,
+    "query_api": query_api,
 }
 
 # System prompt for the agent
-SYSTEM_PROMPT = """You are a helpful assistant that answers questions using the project wiki.
-You have access to two tools:
+SYSTEM_PROMPT = """You are a helpful assistant that answers questions efficiently using:
+1. The project wiki (for documentation)
+2. The source code (for implementation details)
+3. The backend API (for live data)
+
+You have access to three tools:
 - list_files: List files in a directory
 - read_file: Read the contents of a file
+- query_api: Call the backend API to query data or test endpoints
 
-To answer a question:
-1. First use list_files to explore the wiki directory structure if needed
-2. Use read_file to read relevant wiki files
-3. Find the answer in the file contents
-4. Provide the answer with a source reference (file path and section anchor)
+Tool selection guide:
+- For wiki/documentation questions (git, docker, ssh, etc.) → use read_file on wiki/filename.md
+- For source code questions (framework, architecture, code structure) → use read_file on specific files like backend/app/main.py
+- For data questions (counts, scores, records, "how many") → use query_api with GET
+- For API behavior questions (status codes, errors, authentication) → use query_api
 
-Always include the source field in your final answer. The source should be in the format: wiki/filename.md#section-anchor
+When using query_api:
+- Use GET for retrieving data (most common)
+- Check the status_code in the response
+- For authentication errors (401, 403), note that the API requires an API key
 
-If the question is about git, check files like git-vscode.md or git-workflow.md.
-If the question is about docker, check docker.md or docker-compose.md.
-Be specific about which file and section contains the answer."""
+Always provide a source reference when applicable:
+- Wiki files: wiki/filename.md#section-anchor
+- Source files: path/to/file.py
+- API responses: API endpoint path (e.g., GET /items/)
+
+Be concise and direct. Minimize tool calls - prefer reading specific files directly rather than exploring with list_files."""
 
 
 def call_llm(messages: list, settings: Settings, tools: list | None = None) -> dict:
@@ -247,11 +400,12 @@ def call_llm(messages: list, settings: Settings, tools: list | None = None) -> d
     return data
 
 
-def execute_tool_call(tool_call: dict) -> dict:
+def execute_tool_call(tool_call: dict, settings: Settings | None = None) -> dict:
     """Execute a single tool call and return the result.
 
     Args:
         tool_call: Dict with 'function' containing 'name' and 'arguments'
+        settings: Optional settings object for tools that need it
 
     Returns:
         Dict with 'tool', 'args', and 'result'
@@ -278,7 +432,11 @@ def execute_tool_call(tool_call: dict) -> dict:
         }
 
     try:
-        result = TOOL_FUNCTIONS[tool_name](**args)
+        # Pass settings to query_api
+        if tool_name == "query_api":
+            result = TOOL_FUNCTIONS[tool_name](**args, settings=settings)
+        else:
+            result = TOOL_FUNCTIONS[tool_name](**args)
     except TypeError as e:
         result = f"Error: Invalid arguments for {tool_name}: {e}"
     except Exception as e:
@@ -331,7 +489,7 @@ def run_agentic_loop(question: str, settings: Settings) -> tuple[str, str, list]
         if not tool_calls_in_response:
             # No tool calls - this is the final answer
             print("LLM returned final answer (no tool calls)", file=sys.stderr)
-            answer = assistant_message.get("content", "")
+            answer = assistant_message.get("content") or ""
 
             # Try to extract source from the answer
             source = extract_source_from_answer(answer)
@@ -340,7 +498,7 @@ def run_agentic_loop(question: str, settings: Settings) -> tuple[str, str, list]
 
         # Execute each tool call
         for tool_call in tool_calls_in_response:
-            result = execute_tool_call(tool_call)
+            result = execute_tool_call(tool_call, settings)
             tool_calls.append(result)
 
             print(f"Tool result: {result['result'][:100]}...", file=sys.stderr)
@@ -367,7 +525,7 @@ def run_agentic_loop(question: str, settings: Settings) -> tuple[str, str, list]
     print(f"Warning: Reached maximum tool calls ({MAX_TOOL_CALLS})", file=sys.stderr)
 
     # Try to get an answer from the last response
-    answer = assistant_message.get("content", "")
+    answer = assistant_message.get("content") or ""
     source = extract_source_from_answer(answer)
 
     return answer, source, tool_calls
@@ -378,8 +536,8 @@ def extract_source_from_answer(answer: str) -> str:
 
     Looks for patterns like:
     - wiki/filename.md#section
-    - See wiki/filename.md
-    - (wiki/filename.md)
+    - path/to/file.py
+    - GET /api/endpoint
 
     Args:
         answer: The answer text
@@ -387,12 +545,21 @@ def extract_source_from_answer(answer: str) -> str:
     Returns:
         Extracted source reference, or empty string if not found
     """
-    import re
-
     # Look for wiki file references with anchors
-    pattern = r"wiki/[\w-]+\.md(?:#[\w-]+)?"
-    match = re.search(pattern, answer)
+    wiki_pattern = r"wiki/[\w-]+\.md(?:#[\w-]+)?"
+    match = re.search(wiki_pattern, answer)
+    if match:
+        return match.group(0)
 
+    # Look for Python file references
+    py_pattern = r"[\w./]+\.py(?::[\w_]+)?"
+    match = re.search(py_pattern, answer)
+    if match:
+        return match.group(0)
+
+    # Look for API endpoint references
+    api_pattern = r"(?:GET|POST|PUT|DELETE)\s+/[\w./-]+"
+    match = re.search(api_pattern, answer)
     if match:
         return match.group(0)
 

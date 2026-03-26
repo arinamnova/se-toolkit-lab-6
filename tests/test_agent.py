@@ -168,3 +168,118 @@ def test_agent_list_files_tool():
     # Check answer exists
     assert "answer" in data, "Missing 'answer' field in output"
     assert data["answer"], "'answer' field is empty"
+
+
+def test_agent_read_file_for_source_code():
+    """Test that agent.py uses read_file tool for source code questions.
+
+    This test runs agent.py with a question about the backend framework
+    and verifies:
+    - The output contains tool_calls
+    - At least one tool_call uses 'read_file'
+    - The answer mentions FastAPI
+    """
+    # Run agent.py with a question that requires reading source code
+    result = subprocess.run(
+        [sys.executable, "agent.py", "What Python web framework does the backend use?"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    # Check exit code
+    assert result.returncode == 0, (
+        f"Agent exited with code {result.returncode}: {result.stderr}"
+    )
+
+    # Parse JSON
+    try:
+        data = json.loads(result.stdout.strip())
+    except json.JSONDecodeError as e:
+        raise AssertionError(
+            f"Agent output is not valid JSON: {result.stdout[:200]}"
+        ) from e
+
+    # Check tool_calls is not empty
+    assert len(data["tool_calls"]) > 0, (
+        "Expected tool_calls to be non-empty for source code question"
+    )
+
+    # Check that read_file was used
+    tool_names = [call.get("tool") for call in data["tool_calls"]]
+    assert "read_file" in tool_names, (
+        f"Expected 'read_file' in tool_calls, got: {tool_names}"
+    )
+
+    # Check answer mentions FastAPI
+    assert "answer" in data, "Missing 'answer' field in output"
+    answer = data["answer"].lower()
+    assert "fastapi" in answer, (
+        f"Expected answer to mention 'FastAPI', got: {data['answer'][:200]}"
+    )
+
+
+def test_agent_query_api_for_data():
+    """Test that agent.py uses query_api tool for data questions.
+
+    This test runs agent.py with a question about database contents
+    and verifies:
+    - The output contains tool_calls
+    - At least one tool_call uses 'query_api'
+    - The answer contains a number (item count)
+
+    Note: This test requires the backend API to be running.
+    """
+    import os
+
+    # Skip if backend is not running
+    lms_api_key = os.environ.get("LMS_API_KEY", "")
+    if not lms_api_key:
+        # Try to load from .env.docker.secret
+        env_file = Path(".env.docker.secret")
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                if line.startswith("LMS_API_KEY="):
+                    lms_api_key = line.split("=", 1)[1].strip()
+                    os.environ["LMS_API_KEY"] = lms_api_key
+                    break
+
+    # Run agent.py with a question that requires querying the API
+    result = subprocess.run(
+        [sys.executable, "agent.py", "How many items are in the database?"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    # Check exit code
+    assert result.returncode == 0, (
+        f"Agent exited with code {result.returncode}: {result.stderr}"
+    )
+
+    # Parse JSON
+    try:
+        data = json.loads(result.stdout.strip())
+    except json.JSONDecodeError as e:
+        raise AssertionError(
+            f"Agent output is not valid JSON: {result.stdout[:200]}"
+        ) from e
+
+    # Check tool_calls is not empty
+    assert len(data["tool_calls"]) > 0, (
+        "Expected tool_calls to be non-empty for data question"
+    )
+
+    # Check that query_api was used
+    tool_names = [call.get("tool") for call in data["tool_calls"]]
+    assert "query_api" in tool_names, (
+        f"Expected 'query_api' in tool_calls, got: {tool_names}"
+    )
+
+    # Check answer contains a number
+    assert "answer" in data, "Missing 'answer' field in output"
+    answer = data["answer"]
+    import re
+
+    numbers = re.findall(r"\d+", answer)
+    assert len(numbers) > 0, f"Expected answer to contain a number, got: {answer[:200]}"
